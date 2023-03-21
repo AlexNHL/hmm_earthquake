@@ -1,0 +1,554 @@
+---
+title: "HMM"
+author: "null"
+date: '2022-11-19'
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+    ```{r setup, include=FALSE} 
+    knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+    ```
+
+## R Code
+
+```{r}
+#Earthquakes Data
+quakes = read.table("http://www.hmms-for-time-series.de/second/data/earthquakes.txt")
+names(quakes) = c("year","earthquake count")
+x<-quakes[,2][-length(quakes[,2])]    #counts of earthquakes in 1990-2005
+x.test<-quakes[,2][length(quakes[,2])] #count of earthquakes in 2006
+```
+
+## Library Import
+
+```{r}
+library(timeDate)
+```
+
+## Exploratory Data Analysis (EDA)
+
+```{r}
+###-------------------------------------------------------------###
+#KDE
+### standard KDE
+###------------------------------------------------------------------------------
+# (a) define kde
+kde = function(x,K=NULL,bw=NULL,C=c(0.9,1.06),at=NULL,plot=TRUE,...){
+  # x = data
+  # K = kernel funciton 
+  # bw = bandwidth 
+  # C = coefficient of rule-of-thumb BW
+  # at = function input of the KDE, i.e., \hat{f}(at)
+  # plot = whether to plot the KDE 
+  n = length(x) 
+  if(is.null(K)){
+    K = dnorm
+  }else{
+    K0 = K
+    sigma = sqrt(integrate(function(t){K0(t)*t^2},-Inf,Inf)$value)
+    K = function(t){ K0(t*sigma)*sigma }
+  }
+  if(is.null(bw)){ 
+    s = min(sd(x), diff(quantile(x,c(.25,.75)))/1.34)
+    bw = C[1]*s*n^(-1/5)
+  }
+  if(is.null(at)){ 
+    at=seq(min(x)-0.2*diff(range(x)),to=max(x)+0.2*diff(range(x)),length=1001)
+  }
+  d = rep(NA,length(at))
+  for(j in 1:length(at)){
+    d[j] = mean(K((x-(at[j]))/bw))/bw
+  }
+  if(plot){ 
+    plot(at,d,type="l",ylim=c(0,max(d)),ylab="Density",
+         xlab=bquote(N==.(n)~"  Bandwidth"==.(round(bw,5))),...)
+  }
+  d
+}
+```
+
+```{r}
+par(mfrow = c(1,3))
+# (c) plot standard kde 
+col = c("red4")
+lty = c(1,2)
+a = kde(x,main="The distribution",lwd=2,col=col[1],lty=lty[1])
+
+lines(c(-20,0),c(0,0),col=col[2],lwd=2,lty=lty[2])
+lines(c(100,120),c(0,0),col=col[2],lwd=2,lty=lty[2])
+
+# Create time series plot
+x = ts(x, end=2005)
+ts.plot(x,main = "Time Series Plot",xlab = "Year", ylab = "Number")
+
+# Frequency table
+earthquake.table = table(x)
+plot(x, xlim = c(0,45), ylim = c(0,30), xlab = "Number", ylab = "Frequency", main = "Frequency Distribution")
+points(0:45, dpois(0:45, lambda = mean(x)) * dim(quakes)[1], pch = 19)
+mtext("No. of major earthquakes from 1900-2005",side=3,line=-1,outer=TRUE)
+
+```
+
+```{r}
+###-------------------------------------------------------------###
+# Checking Missing Values
+count_of_NA=function(x){
+  sum=0
+  for (i in 1:ncol(x)) {
+    cat("in column",colnames(x[i]),"total NA values=",colSums(is.na(x[i])), "\n")
+  }
+}
+count_of_NA(quakes)
+# no missing value
+```
+
+```{r}
+###-------------------------------------------------------------###
+# Descriptive statistics 
+skewness(x) 
+summary(x)
+var(x)
+
+###-------------------------------------------------------------###
+```
+
+## EM algorithm
+
+```{r}
+#Forward and backward function 
+pois.HMM.lalphabeta=function(x,m,lambda,gamma,delta=NULL)
+{
+  if (is.null(delta)) {delta=solve(t(diag(m)-gamma+1),rep(1,m))}
+  n <- length(x)
+  lalpha <- lbeta<- matrix(NA,m,n) # generate alpha and beta for each observation
+  
+  allprobs <- outer(x,lambda,dpois) #Emission Probability( conditional probability given different states)
+  foo <- delta*allprobs[1,]  #Initialization
+  sumfoo <- sum(foo)
+  lscale <- log(sumfoo)
+  foo <- foo/sumfoo
+  lalpha[,1] <- log(foo)+lscale
+  
+  for (i in 2:n) # forward equation 
+  {
+    foo <- foo%*%gamma*allprobs[i,]  # base on last foo (p19 theorem 6 matrix form)
+    sumfoo <- sum(foo)  
+    lscale <- lscale+log(sumfoo)
+    foo <- foo/sumfoo
+    lalpha[,i] <- log(foo)+lscale
+  }
+  
+  lbeta[,n] <- rep(0,m)
+  foo       <- rep(1/m,m)
+  lscale    <- log(m)
+  
+  for (i in (n-1):1) # backward equation
+  {
+    foo <- gamma%*%(allprobs[i+1,]*foo)
+    lbeta[,i] <- log(foo) + lscale
+    sumfoo <- sum(foo)
+    foo <- foo/sumfoo
+    lscale <- lscale+log(sumfoo)
+  }
+  
+  list(la=lalpha,lb=lbeta) 
+}
+```
+
+```{r}
+#Iterative function for EM algorithm
+pois.HMM.EM <- function(x,m,lambda ,gamma ,delta ,maxiter =1000 , tol=1e-6 ,...)
+{
+  lambda.next <- lambda
+  gamma.next <- gamma
+  delta.next <- delta
+  n<- length(x)
+  for (iter in 1: maxiter)   #Start and loop iterations 
+  {
+    lallprobs <- outer(x,lambda,dpois,log=TRUE)
+    fb <- pois.HMM.lalphabeta(x,m,lambda,gamma ,delta=delta)
+    la <- fb$la 
+    lb <- fb$lb
+    c <- max(la[,n]) #reduce the chance of underflow in the exponentiation
+    llk <- c+log(sum(exp(la[,n]-c))) #log-likelihood function
+    for (j in 1:m)           #E and M-steps 
+    {
+      for (k in 1:m)
+      {
+        gamma.next[j,k] <- gamma[j,k]*sum(exp(la[j ,1:(n-1)]+lallprobs [2:n,k]+lb[k,2:n]-llk))  
+      }
+      
+      lambda.next[j] <- sum(exp(la[j,]+lb[j,]-llk)*x)/sum(exp(la[j,]+lb[j,]-llk))
+      #Updating lambda(parameter of poisson dist)
+    }
+    gamma.next <- gamma.next/apply(gamma.next ,1,sum)  #Updating gamma(transition probability matrix) #sum of row = 1
+    delta.next <- exp(la[,1]+lb[,1]-llk) #update the delta
+    delta.next <- delta.next/sum(delta.next) #sum of delta=1
+    crit <- sum(abs(lambda -lambda.next)) +  #convergence criterion
+      sum(abs(gamma -gamma.next)) +
+      sum(abs(delta -delta.next))
+    if(crit< tol){             #stop loop if converges
+      np <- m*m+m-1
+      AIC <- (-2*(llk -np))
+      BIC <- (-2*llk+np*log(n))
+      return(list(m=m,lambda=lambda ,gamma=gamma ,delta=delta , mllk=-llk ,AIC=AIC ,BIC=BIC))
+    }
+    lambda <- lambda.next #update parameters
+    gamma <- gamma.next
+    delta <- delta.next
+    
+  }
+  return(list(m=m,lambda=lambda ,gamma=gamma ,delta=delta , mllk=-llk ,AIC=AIC ,BIC=BIC))
+  
+  print(paste ("No convergence after",maxiter ," iterations "))
+  NA
+}
+```
+
+### EM with Different Number of States (m=1,2,3,4)
+
+#### m=1
+
+```{r}
+#initialization
+n<-length(quakes[,2])
+m<-1
+lambda0<-19
+gamma0<-matrix(1,1,1)
+delta0<-1
+#Result
+EM_1state<-pois.HMM.EM(x,m,lambda=lambda0 ,gamma=gamma0 ,delta=delta0 ,maxiter =1000 , tol=1e-6)
+EM_1state
+```
+
+#### m=2
+
+```{r}
+#initialization
+m<-2
+lambda0<-c(15,25)
+gamma0<-matrix(
+c(
+0.9,0.1,
+0.1,0.9
+),m,m,byrow=TRUE)
+delta0 <-solve(t(diag(m)-gamma0 +1),rep(1,m))
+#Result
+EM_2states<-pois.HMM.EM(x,m,lambda=lambda0 ,gamma=gamma0 ,delta=delta0 ,maxiter =1000 , tol=1e-6)
+EM_2states
+```
+
+#### m=3
+
+```{r}
+#initialization
+m<-3
+lambda0<-c(10,20,30)
+gamma0<-matrix(
+c(
+ 0.8,0.1,0.1,
+ 0.1,0.8,0.1,
+ 0.1,0.1,0.8
+),m,m,byrow=TRUE)
+delta0 <-solve(t(diag(m)-gamma0 +1),rep(1,m))
+#Result
+EM_3states<-pois.HMM.EM(x,m,lambda=lambda0 ,gamma=gamma0 ,delta=delta0 ,maxiter =1000 , tol=1e-6)
+EM_3states
+```
+
+#### m=4
+
+```{r}
+#initialization
+m<-4
+lambda0<-c(10,15,20,30)
+gamma0<-matrix(
+  c(
+    0.85,0.05,0.05,0.05,
+    0.05,0.85,0.05,0.05,
+    0.05,0.05,0.85,0.05,
+    0.05,0.05,0.05,0.85
+  ),m,m,byrow=TRUE)
+delta0 <-solve(t(diag(m)-gamma0 +1),rep(1,m))
+#Result
+EM_4states<-pois.HMM.EM(x,m,lambda=lambda0 ,gamma=gamma0 ,delta=delta0 ,maxiter =1000 , tol=1e-6)
+EM_4states
+```
+
+## Model Selection
+
+```{r}
+model <- c("1_state","2_state","3_state","4_state")
+AIC <- c(EM_1state$AIC,EM_2states$AIC,EM_3states$AIC,EM_4states$AIC)
+BIC <- c(EM_1state$BIC,EM_2states$BIC,EM_3states$BIC,EM_4states$BIC)
+
+df <- data.frame(model,AIC,BIC)
+df
+
+#3_states having best performance
+```
+
+## Local Decoding
+
+```{r}
+#Conditional state probability
+pois.HMM.state_probs<-function(x,m,lambda,gamma,delta=NULL,...){
+  if(is.null(delta))delta<-solve(t(diag(m)-gamma+1),rep(1,m))
+  n<-length(x)
+  fb<-pois.HMM.lalphabeta(x,m,lambda,gamma,delta=delta)
+  la<-fb$la
+  lb<-fb$lb
+  c<-max(la[,n])
+  lik<-c+log(sum(exp(la[,n]-c)))
+  stateprobs<-matrix(NA,ncol=n,nrow=m)
+  for (i in 1:n) {
+    stateprobs[,i]<-exp(la[,i]+lb[,i]-lik)
+  }
+  stateprobs
+}
+```
+
+```{r}
+#local decoding 
+pois.HMM.local_decoding<-function(x,m,lambda,gamma,delta=delta){
+  n<-length(x)
+  stateprobs<-pois.HMM.state_probs(x,m,lambda,gamma,delta=delta)
+  ild<-rep(NA,n)
+  for(i in 1:n) ild[i] <- which.max(stateprobs[,i])
+  ild
+}
+```
+
+```{r}
+local_decoding_plot<-function(year,count,m,EM_mod){
+  local_decoding<-pois.HMM.local_decoding(count,m,lambda = EM_mod$lambda,gamma = EM_mod$gamma,delta = EM_mod$delta)
+  plot(year,count,type = "l",main=paste0("Local Decoding m=",m),xlab = "Year", ylab = "Count")
+  points(year,EM_mod$lambda[local_decoding],pch = 20)
+  abline(h=EM_mod$lambda,col="dark green",lty=2)
+}
+
+par(mfrow=c(2,2))
+local_decoding_plot(quakes[,1][-length(quakes[,1])],x,1, EM_1state)
+local_decoding_plot(quakes[,1][-length(quakes[,1])],x,2, EM_2states)
+local_decoding_plot(quakes[,1][-length(quakes[,1])],x,3, EM_3states)
+local_decoding_plot(quakes[,1][-length(quakes[,1])],x,4, EM_4states)
+```
+
+## Global Decoding
+
+```{r}
+# Global decoding - Viterbi algorithm
+pois.HMM.viterbi<-function(x,m,mod){
+  n <- length(x)
+  xi <- matrix(0,n,m)
+  foo <- mod$delta*dpois(x[1],mod$lambda) #Calculating P(C1=i,X1=x1)
+  xi[1,] <- foo/sum(foo)
+  for (i in 2:n){
+    foo <- apply(xi[i-1,]*mod$gamma,2,max)*dpois(x[i],mod$lambda) #Calculating prob
+    xi[i,] <- foo/sum(foo)
+  }
+  iv <- numeric(n) 
+  iv[n] <- which.max(xi[n,])  #Evaluate best State at t=n
+  for (i in (n-1):1){         #Evaluate best State at t=n-1,...,1 backwardly
+    iv[i] <- which.max(mod$gamma[,iv[i+1]]*xi[i,])
+  }
+  return(iv) #Obtain every best states in time series
+}
+```
+
+```{r}
+global_decoding_plot<-function(year,count,m,EM_mod){
+  global_decoding<-pois.HMM.viterbi(count,m, EM_mod)
+  plot(year,count,type = "l",main=paste0("Global Decoding m=",m),xlab = "Year", ylab = "Count")
+  points(year,EM_mod$lambda[global_decoding],pch=20)
+  abline(h=EM_mod$lambda,col="dark green",lty=2)
+}
+
+par(mfrow=c(2,2))
+global_decoding_plot(quakes[,1][-length(quakes[,1])],x,1, EM_1state)
+global_decoding_plot(quakes[,1][-length(quakes[,1])],x,2, EM_2states)
+global_decoding_plot(quakes[,1][-length(quakes[,1])],x,3, EM_3states)
+global_decoding_plot(quakes[,1][-length(quakes[,1])],x,4, EM_4states)
+```
+
+```{r}
+#Conditional probability of inferred state given true state
+pois.HMM.generate_sample <-                               
+ function(n,m,lambda,gamma,delta=NULL)                     
+{                                                           
+ if(is.null(delta))delta<-solve(t(diag(m)-gamma+1),rep(1,m))    
+ mvect <- 1:m                                               
+ state <- numeric(n)                                        
+ state[1] <- sample(mvect,1,prob=delta)  #initial                   
+ for (i in 2:n)                                             
+   state[i]<-sample(mvect,1,prob=gamma[state[i-1],]) #generate 
+ x <- rpois(n,lambda=lambda[state]) #                      
+ data.frame(x,state)                                                  
+ }
+#Simulated result
+set.seed(4011)
+sim_data<-pois.HMM.generate_sample(10000,3,EM_3states$lambda,EM_3states$gamma)
+
+
+#Prob(inferred state = j | true state = i) for i,j=1,2,3
+true_decoding<-function(x,m,EM_mod){
+  output<-matrix(0,m,m)
+  true<-x$state
+  global_decoding<-pois.HMM.viterbi(x$x,m, EM_mod)
+  for (i in 1:m) {
+    sum_state <- sum(true==i)
+    for (j in 1:m) {
+      output[i,j]<-sum((global_decoding==j&true==i))/sum_state
+    }
+  }
+  return(output)
+}
+true_decoding(sim_data,3,EM_3states)
+```
+
+## Residuals
+
+```{r}
+#== Conditional probability that observation at time t equals
+# xc , given all observations other than that at time t .
+# Note : xc is a vector and the result ( dxc ) is a matrix .
+pois.HMM.conditionals <-                                    
+ function(x,m,lambda,gamma,delta=NULL,xrange=NULL,...)      
+{                                                           
+ if(is.null(delta))                                        
+   delta  <- solve(t(diag(m)-gamma+1),rep(1,m))             
+ if(is.null(xrange))                                        
+   xrange <-qpois(0.001,min(lambda)):                       
+            qpois(0.999,max(lambda))                        
+ n      <- length(x)                                        
+ fb     <- pois.HMM.lalphabeta(x,m,lambda,gamma,delta=delta)  
+ la     <- fb$la                                            
+ lb     <- fb$lb                                           
+ la     <- cbind(log(delta),la)                             
+ lafact <- apply(la,2,max)                                  
+ lbfact <- apply(lb,2,max)                                  
+ w      <- matrix(NA,ncol=n,nrow=m)                         
+ for (i in 1:n)                                             
+   {                                                        
+   foo   <- (exp(la[,i]-lafact[i])%*%gamma)*               
+             exp(lb[,i]-lbfact[i])                          
+   w[,i] <- foo/sum(foo)                                    
+   }                                                        
+ allprobs <- outer(xrange,lambda,dpois)                     
+ cdists   <- allprobs%*%w                                   
+ list(xrange=xrange,cdists=cdists)                         
+}                                                           
+```
+
+```{r}
+pois.HMM.pseudo_residuals <-                                
+ function(x,m,lambda,gamma, delta=NULL,...)                 
+{                                                           
+ if(is.null(delta))delta<-solve(t(diag(m)-gamma+1),rep(1,m))   
+ n        <- length(x)                                      
+ cdists   <- pois.HMM.conditionals(x,m,lambda, gamma,       
+                  delta=delta,xrange=0:max(x))$cdists       
+ cumdists <- rbind(rep(0,n),apply(cdists,2,cumsum))         
+ ul <- uh <- rep(NA,n)                                      
+ for (i in 1:n)                                             
+   {                                                        
+   ul[i]  <- cumdists[x[i]+1,i]                             
+   uh[i]  <- cumdists[x[i]+2,i]                             
+   }                                                        
+ um       <- 0.5*(ul+uh)                                   
+ npsr     <- qnorm(rbind(ul,um,uh))                         
+ npsr                                                       
+}  
+```
+
+```{r}
+# 1900-2005
+r1<-pois.HMM.pseudo_residuals(quakes[,2],1,EM_1state$lambda, EM_1state$gamma, EM_1state$delta)
+r2<-pois.HMM.pseudo_residuals(quakes[,2],2,EM_2states$lambda, EM_2states$gamma, EM_2states$delta)
+r3<-pois.HMM.pseudo_residuals(quakes[,2],3,EM_3states$lambda, EM_3states$gamma, EM_3states$delta)
+r4<-pois.HMM.pseudo_residuals(quakes[,2],4,EM_4states$lambda, EM_4states$gamma, EM_4states$delta)
+par(mfrow = c(2,4))
+
+#acf
+acf(r1[2,],main="no. of states=1")
+acf(r2[2,],main="no. of states=2")
+acf(r3[2,],main="no. of states=3")
+acf(r4[2,],main="no. of states=4")
+
+#residual plot
+theo.quant<-sort(rnorm(n))
+qqplot(theo.quant,sort(r1[2,]),xlab = "theoretical quantities",ylab = "normal residuals",main="no. of states=1")
+abline(a=0,b=1)
+qqplot(theo.quant,sort(r2[2,]),xlab = "theoretical quantities",ylab = "normal residuals",main="no. of states=2")
+abline(a=0,b=1)
+qqplot(theo.quant,sort(r3[2,]),xlab = "theoretical quantities",ylab = "normal residuals",main="no. of states=3")
+abline(a=0,b=1)
+qqplot(theo.quant,sort(r4[2,]),xlab = "theoretical quantities",ylab = "normal residuals",main="no. of states=4")
+abline(a=0,b=1)
+```
+
+```{r}
+#KS test for normality (Kolmogorov_Smirnov test)
+ks1<-ks.test(r1[2,],"pnorm")$p.value
+ks2<-ks.test(r2[2,],"pnorm")$p.value
+ks3<-ks.test(r3[2,],"pnorm")$p.value
+ks4<-ks.test(r4[2,],"pnorm")$p.value
+
+model <- c("1_state","2_state","3_state","4_state")
+p_value <- c(ks1,ks2,ks3,ks4)
+
+df <- data.frame(model,p_value)
+df
+#Accept H0 for 2,3,4-state model
+```
+
+## Forecasting
+
+```{r}
+pois_HMM_forecast <- function ( xf , h =1 ,x , mod )
+{
+ n <- length ( x )
+ nxf <- length ( xf )
+ dxf <- matrix (0 , nrow =h , ncol = nxf )
+ foo <- mod$delta * dpois ( x [1] , mod$lambda )
+ sumfoo <- sum ( foo )
+ lscale <- log ( sumfoo )
+ foo <- foo / sumfoo
+ for ( i in 2: n )
+   {
+     foo <- foo %*% mod$gamma * dpois ( x [ i ] , mod$lambda )
+     sumfoo <- sum ( foo )
+     lscale <- lscale + log ( sumfoo )
+     foo <- foo / sumfoo
+ }
+
+ for ( i in 1: h )
+    {
+      foo <- foo %*% mod$gamma
+      for ( j in 1: mod$m ) 
+      {
+        dxf [i ,] <- dxf [i ,] + foo [ j ]* dpois ( xf , mod$lambda [ j ])}
+      }
+  return ( dxf )
+}
+
+```
+
+```{r}
+h <-1
+xf <-0:50
+d <- quakes[,1][-length(quakes[,1])]
+forecasts <- pois_HMM_forecast ( xf ,h ,x , EM_3states)
+
+fc <- forecasts [1 ,]
+par ( mfrow = c (1 ,1) , las =1)
+plot ( xf , fc , type ="h" ,main = paste (" Earthquake series : forecast distribution for " , d [ n-1 ]+1) ,xlim = c (0 , max ( xf ) ), ylim = c (0 ,0.12) , xlab =" count " , ylab =" probability " , lwd =3)
+
+cat("autcal_value_2006: ", x.test)
+cat("\nforcast_expectation_value_2006: ", sum(xf*forecasts))
+
+abline(v=x.test, col="red",lwd=3) #actual count in 2006
+```
